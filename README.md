@@ -40,8 +40,8 @@ Poly is an **orchestrator**. It drives the standard, freely-available tools you 
 ## Quick start
 
 ```bash
-git clone https://github.com/steckh/Polyy
-cd Polyy
+git clone https://github.com/steckh/Poly
+cd Poly
 python3 poly.py
 ```
 
