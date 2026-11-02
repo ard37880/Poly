@@ -183,3 +183,22 @@ cython_debug/
 poly_flags.json
 poly_targets.json
 setup.sh
+
+# ---- Poly runtime state (never commit) ----
+poly_targets.json
+poly_flags.json
+results/
+setup.sh
+poly_report_*.md
+writeup_*.md
+findings.sqlite3
+*.sqlite3
+
+# ---- private / local-only (not part of the public recon build) ----
+poly_pro.py
+polycore/
+tests/
+MANUAL.md
+PRO_EXTENSION.md
+Poly.zip
+engagement-*/
