@@ -22,15 +22,14 @@ runs exploits or reverse shells.
 
 import os
 import re
-import ssl
 import sys
 import json
 import shutil
+import socket
 import datetime
+import tempfile
 import ipaddress
 import urllib.parse
-import urllib.error
-import urllib.request
 import subprocess
 import xml.etree.ElementTree as ET
 
@@ -50,8 +49,6 @@ CONFIG = {
     "vhost_domain": "",          # e.g. "htb" or "example.com" -> deep scan fuzzes vhosts; "" disables it
     "keep_raw_files": False,     # False = one tidy scan folder (summary.md + nmap.xml + details.txt); True = keep every raw tool file
 }
-
-# Team roles. Put a name in the first field, or leave it "" for unassigned.
 
 # ======================================================================
 # content  -  generic CTF reference; edit freely
@@ -92,30 +89,65 @@ ADVISOR = [
 ]
 
 SETUP_SCRIPT = r"""#!/usr/bin/env bash
-# Role-aware tool setup. Detects apt vs pacman.
-# Installs standard, freely-available security tooling.
+# Tool setup for Poly. Detects apt, pacman or Homebrew.
+# Each package is installed on its own, so one name your distro does not carry
+# cannot stop the rest from installing. Whatever failed is listed at the end.
 # Usage:  bash setup.sh
-set -e
-if command -v apt >/dev/null 2>&1; then
-  PM="sudo apt install -y"; sudo apt update
+FAILED=""
+if command -v apt-get >/dev/null 2>&1; then
+  sudo apt-get update
+  inst() { sudo apt-get install -y "$1" >/dev/null 2>&1; }
+  CORE="nmap curl wget git python3 python3-pip python3-venv pipx file binwalk libimage-exiftool-perl steghide foremost gdb radare2"
+  WEB="feroxbuster ffuf gobuster dirb sqlmap whatweb nikto recon-ng exploitdb seclists enum4linux-ng"
+  NET="netexec smbclient smbmap snmp hydra john xclip chisel ligolo-ng"
 elif command -v pacman >/dev/null 2>&1; then
-  PM="sudo pacman -S --needed --noconfirm"
+  inst() { sudo pacman -S --needed --noconfirm "$1" >/dev/null 2>&1; }
+  CORE="nmap curl wget git python python-pip python-pipx file binwalk perl-image-exiftool gdb radare2"
+  WEB="feroxbuster ffuf gobuster sqlmap nikto"
+  NET="smbclient net-snmp hydra john xclip"
+elif command -v brew >/dev/null 2>&1; then
+  inst() { brew install "$1" >/dev/null 2>&1; }
+  CORE="nmap curl wget git python pipx binwalk exiftool radare2"
+  WEB="feroxbuster ffuf gobuster sqlmap nikto whatweb exploitdb"
+  NET="net-snmp hydra john-jumbo"
 else
-  echo "No apt or pacman found. Install tools by hand."; exit 1
+  echo "No apt, pacman or brew found. Install tools by hand."; exit 1
 fi
-echo "[*] Core triage"
-$PM nmap curl wget git python3 python3-pip file binwalk exiftool steghide foremost gdb radare2 || true
-echo "[*] Web + recon"
-$PM feroxbuster ffuf gobuster dirb sqlmap whatweb nikto recon-ng exploitdb seclists enum4linux-ng || true
-echo "[*] SMB / AD + pivoting"
-$PM chisel ligolo-ng 2>/dev/null || true
-command -v pipx >/dev/null 2>&1 || $PM pipx || true
-pipx install netexec 2>/dev/null || true   # crackmapexec successor (smb/winrm/ldap enum)
-echo "[*] Python libs (pip)"
-pip install --user pwntools pycryptodome sympy gmpy2 2>/dev/null || pip install --break-system-packages pwntools pycryptodome sympy gmpy2 || true
-echo "[*] Memory forensics"
-command -v pipx >/dev/null 2>&1 || $PM pipx || true
-pipx install volatility3 2>/dev/null || true
+
+try_all() {
+  for p in "$@"; do
+    printf '  %-24s' "$p"
+    if inst "$p"; then echo ok; else echo "not available here"; FAILED="$FAILED $p"; fi
+  done
+}
+
+echo "[*] Core triage";  try_all $CORE
+echo "[*] Web + recon";  try_all $WEB
+echo "[*] SMB / AD + pivoting"; try_all $NET
+
+# netexec and enum4linux-ng are only packaged on Kali/Parrot; pipx gets them anywhere
+if command -v pipx >/dev/null 2>&1; then
+  command -v netexec >/dev/null 2>&1 || pipx install git+https://github.com/Pennyw0rth/NetExec >/dev/null 2>&1 \
+    || FAILED="$FAILED netexec(pipx)"
+  command -v enum4linux-ng >/dev/null 2>&1 || pipx install git+https://github.com/cddmp/enum4linux-ng >/dev/null 2>&1 \
+    || FAILED="$FAILED enum4linux-ng(pipx)"
+  command -v vol >/dev/null 2>&1 || pipx install volatility3 >/dev/null 2>&1 || FAILED="$FAILED volatility3(pipx)"
+fi
+
+# CTF python libs go in their own venv: modern distros refuse system-wide pip
+# installs (PEP 668), and forcing it can break the system python
+echo "[*] Python libs -> ~/.venvs/ctf"
+if python3 -m venv "$HOME/.venvs/ctf" && "$HOME/.venvs/ctf/bin/pip" install -q pwntools pycryptodome sympy gmpy2; then
+  echo "  ok. Use them with:  source ~/.venvs/ctf/bin/activate"
+else
+  FAILED="$FAILED python-libs"
+fi
+
+echo
+if [ -n "$FAILED" ]; then
+  echo "[!] Not installed:$FAILED"
+  echo "    Some of these are only packaged on Kali/Parrot (or BlackArch/AUR on Arch); install those by hand."
+fi
 echo "[*] Done. Bookmark CyberChef (gchq.github.io/CyberChef) and install Ghidra or Binary Ninja separately."
 """
 
@@ -168,24 +200,28 @@ WORDLIST = next((w for w in [
 
 SCAN_TIMEOUT = 1800  # seconds, per tool
 
-def _dir_cmd(url, outpath):
+def _dir_cmd(url):
     """Build the directory-brute command from CONFIG['dir_tool'], falling back
     to whatever is actually installed. Returns (label, argv) or None."""
     pref = (CONFIG.get("dir_tool") or "feroxbuster").lower()
     order = [pref] + [t for t in ("feroxbuster", "ffuf", "gobuster", "dirb") if t != pref]
+    tls = url.lower().startswith("https://")   # lab boxes use self-signed certs
     for tool in order:
         if shutil.which(tool) is None:
             continue
-        # all of these print results to stdout; _run_tool captures that to outpath
+        # all of these print results to stdout; _run_tool captures that to the output file
         if tool == "feroxbuster":
             cmd = ["feroxbuster", "-u", url, "--silent", "--no-state"]
+            if tls:
+                cmd.append("-k")
             if WORDLIST:
                 cmd += ["-w", WORDLIST]
             return ("feroxbuster", cmd)
         if tool == "ffuf" and WORDLIST:
             return ("ffuf", ["ffuf", "-u", url.rstrip("/") + "/FUZZ", "-w", WORDLIST, "-ac", "-s"])
         if tool == "gobuster" and WORDLIST:
-            return ("gobuster", ["gobuster", "dir", "-q", "-u", url, "-w", WORDLIST])
+            return ("gobuster", ["gobuster", "dir", "-q", "-u", url, "-w", WORDLIST]
+                    + (["-k"] if tls else []))
         if tool == "dirb":
             return ("dirb", ["dirb", url] + ([WORDLIST] if WORDLIST else []))
     return None
@@ -193,31 +229,86 @@ def _dir_cmd(url, outpath):
 # ----------------------------------------------------------------------
 # target input: accept an IP (optional :port) OR a link, detect + parse
 # ----------------------------------------------------------------------
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?$")
+
+def _valid_host(h):
+    """An IP address or a plain hostname, nothing else. This is what keeps a
+    target like '--script=x.nse' or '-iL file' from reaching nmap as an option,
+    including targets loaded from a shared poly_targets.json."""
+    if not h or len(h) > 253:
+        return False
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        return bool(_HOSTNAME_RE.match(h))
+
+def _is_v6(h):
+    try:
+        return ipaddress.ip_address(h).version == 6
+    except ValueError:
+        return False
+
+def _nmap_family(h):
+    """nmap needs -6 to scan an IPv6 address."""
+    return ["-6"] if _is_v6(h) else []
+
+def _web_url(scheme, host, port=None, path="/"):
+    h = f"[{host}]" if _is_v6(host) else host
+    default = 443 if scheme == "https" else 80
+    p = f":{port}" if port and int(port) != default else ""
+    return f"{scheme}://{h}{p}{path or '/'}"
+
 def classify_target(raw):
-    """Return dict: kind ('host'|'web'), host, port, scheme, path, display."""
+    """Return dict: kind ('host'|'web'), host, port, scheme, path, display.
+    Returns None for anything that is not a usable IP, host[:port][/path] or
+    http(s) URL."""
     s = raw.strip()
     if not s:
         return None
     if "://" in s:
         u = urllib.parse.urlparse(s)
+        if u.scheme.lower() not in ("http", "https"):
+            return None
         host = u.hostname or ""
-        port = u.port
-        return {"kind": "web", "host": host, "port": port, "scheme": u.scheme,
+        try:
+            port = u.port
+        except ValueError:
+            return None
+        if not _valid_host(host):
+            return None
+        return {"kind": "web", "host": host, "port": port, "scheme": u.scheme.lower(),
                 "path": u.path or "/", "display": s}
-    host_part, _, port_part = s.partition(":")
-    port = None
-    if port_part and port_part.split("/")[0].isdigit():
-        port = int(port_part.split("/")[0])
-    is_ip = False
+    rest, slash, tail = s.partition("/")
+    path = "/" + tail if slash else None
+    host_part, port = rest, None
+    if rest.startswith("["):                       # [v6addr] or [v6addr]:port
+        end = rest.find("]")
+        if end == -1:
+            return None
+        host_part, after = rest[1:end], rest[end + 1:]
+        if after:
+            if not (after.startswith(":") and after[1:].isdigit()):
+                return None
+            port = int(after[1:])
+    elif rest.count(":") == 1:                     # host:port
+        host_part, _, port_s = rest.partition(":")
+        if not port_s.isdigit():
+            return None
+        port = int(port_s)
+    # two or more colons without brackets: a bare IPv6 address, kept as-is
+    if not _valid_host(host_part):
+        return None
+    if port is not None and not 0 < port < 65536:
+        return None
     try:
         ipaddress.ip_address(host_part)
         is_ip = True
     except ValueError:
         is_ip = False
-    has_path = "/" in s
-    if has_path:
+    if path is not None:
         return {"kind": "web", "host": host_part, "port": port, "scheme": "http",
-                "path": "/" + s.split("/", 1)[1], "display": s}
+                "path": path, "display": s}
     return {"kind": "host", "host": host_part, "port": port, "scheme": None,
             "path": None, "display": s, "is_ip": is_ip}
 
@@ -283,6 +374,8 @@ def _safe(s):
 # ----------------------------------------------------------------------
 # nmap parsing + next-step hints
 # ----------------------------------------------------------------------
+_HTTP_FP_RE = re.compile(r"HTTP/1\\?\.[01]\\x20[1-5]\d\d")
+
 def _parse_nmap_xml(path):
     rows = []
     try:
@@ -293,11 +386,23 @@ def _parse_nmap_xml(path):
                 if st is None or st.get("state") != "open":
                     continue
                 svc = port.find("service")
+                name = (svc.get("name") if svc is not None else "") or ""
+                # nmap reports HTTPS as name="http" tunnel="ssl"; keep the tunnel
+                # so the hints and web enum use https (matches nmap's ssl/http)
+                product = (svc.get("product") if svc is not None else "") or ""
+                # a service nmap could not name but that answered with an HTTP
+                # status line is a web server (custom apps, new server versions)
+                fp = (svc.get("servicefp") if svc is not None else "") or ""
+                if name in ("", "unknown") and _HTTP_FP_RE.search(fp):
+                    name = "http"
+                    product = product or "(answers HTTP, nmap could not name it)"
+                if name and svc.get("tunnel") == "ssl":
+                    name = "ssl/" + name
                 rows.append({
                     "port": port.get("portid", "?"),
                     "proto": port.get("protocol", "tcp"),
-                    "service": (svc.get("name") if svc is not None else "") or "",
-                    "product": (svc.get("product") if svc is not None else "") or "",
+                    "service": name,
+                    "product": product,
                     "version": (svc.get("version") if svc is not None else "") or "",
                 })
     except Exception:
@@ -316,6 +421,32 @@ def _open_ports(xmlp):
     except Exception:
         pass
     return ports
+
+_DISCOVERED_RE = re.compile(r"Discovered open port (\d+)/tcp")
+
+def _discovered_ports(txtp):
+    """Open ports from nmap's -v stdout. nmap only writes the XML port list once
+    the host finishes, so if the sweep is killed (timeout, ctrl-c) the XML has
+    nothing in it, but the 'Discovered open port' lines are already on disk."""
+    try:
+        with open(txtp, encoding="utf-8", errors="replace") as f:
+            found = _DISCOVERED_RE.findall(f.read())
+    except OSError:
+        return []
+    return sorted(set(found), key=int)
+
+def _guess_rows(ports):
+    """Stand-in rows when the -sV pass did not finish: open ports from the sweep,
+    with the service name guessed from the port number."""
+    rows = []
+    for p in ports:
+        try:
+            name = socket.getservbyport(int(p), "tcp")
+        except (OSError, ValueError):
+            name = ""
+        rows.append({"port": p, "proto": "tcp", "service": name,
+                     "product": "(guessed from port, -sV did not finish)", "version": ""})
+    return rows
 
 def _parse_scripts(xmlp):
     """Return [(port, script_id, output)] from nmap -sC XML (host- and port-level)."""
@@ -379,7 +510,6 @@ def _service_hint(service, port, host):
     H = {
         "ftp": f"ftp {host}  (try anonymous) ; nmap --script ftp-anon -p{port} {host}",
         "ssh": f"ssh user@{host} -p {port}  (note the version)",
-        "http": f"gobuster dir -u http://{host}:{port}/ -w /usr/share/wordlists/dirb/common.txt ; whatweb http://{host}:{port}/ ; check /robots.txt /.git /.env",
         "microsoft-ds": f"enum4linux-ng {host} ; smbclient -L //{host}/ -N ; smbmap -H {host}",
         "netbios-ssn": f"enum4linux-ng {host} ; smbclient -L //{host}/ -N",
         "snmp": f"snmpwalk -v2c -c public {host}",
@@ -401,11 +531,16 @@ def _service_hint(service, port, host):
     if s in H:
         return H[s]
     if "http" in s:
-        scheme = "https" if ("ssl" in s or str(port) in ("443", "8443")) else "http"
-        return (f"gobuster dir -u {scheme}://{host}:{port}/ -w /usr/share/wordlists/dirb/common.txt"
-                + (" -k" if scheme == "https" else "")
-                + f" ; whatweb {scheme}://{host}:{port}/ ; check /robots.txt /.git /.env")
+        url = _web_url(_http_scheme(s, port), host, port)
+        wl = WORDLIST or "/usr/share/wordlists/dirb/common.txt"
+        return (f"gobuster dir -u {url} -w {wl}"
+                + (" -k" if url.startswith("https") else "")
+                + f" ; whatweb {url} ; check /robots.txt /.git /.env")
     return None
+
+def _http_scheme(service, port):
+    s = (service or "").lower()
+    return "https" if ("ssl" in s or "https" in s or str(port) in ("443", "8443")) else "http"
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
@@ -422,7 +557,9 @@ def _top_cves(scan_dir, limit=8):
         return []
     hits = []
     try:
-        for line in open(sp, encoding="utf-8", errors="replace"):
+        with open(sp, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        for line in lines:
             ln = _strip_ansi(line).strip()
             if not ln or ln.startswith("$") or ln.startswith("#"):
                 continue
@@ -438,19 +575,36 @@ def _top_cves(scan_dir, limit=8):
         pass
     return hits
 
-def _scan_summary(t, xmlp, scan_dir=None, udp_rows=None):
-    rows = _parse_nmap_xml(xmlp)
+def _print_problems(problems):
+    if not problems:
+        return
+    print(f"\n  {C.BOLD}{C.Y}SCAN PROBLEMS{C.X}  {C.DIM}(results below may be incomplete){C.X}")
+    for ln in problems:
+        print(f"    {C.Y}!{C.X} {ln}")
+
+def _scan_summary(t, rows, xmlp, scan_dir=None, udp_rows=None, problems=None):
     udp_rows = udp_rows or []
+    problems = problems or []
+    _print_problems(problems)
     if not rows and not udp_rows:
-        print(f"\n  {C.Y}no open ports parsed from the scan.{C.X}")
-        print(f"  {C.DIM}if you expected some: the box may be booting, your VPN/route to it may be")
-        print(f"  down, or it's fully filtered. Sanity-check reachability with:{C.X}")
-        print(f"    {C.W}nmap -Pn -p22 {t['host']}{C.X}")
+        if problems:
+            print(f"\n  {C.Y}no open ports found, but the scan did not run cleanly (see above).{C.X}")
+            print(f"  {C.DIM}This is not proof the host is down. Fix the problem and rescan.{C.X}")
+        else:
+            print(f"\n  {C.Y}no open ports parsed from the scan.{C.X}")
+            print(f"  {C.DIM}if you expected some: the box may be booting, your VPN/route to it may be")
+            print(f"  down, or it's fully filtered. Sanity-check reachability with:{C.X}")
+            print(f"    {C.W}nmap -Pn -p22 {t['host']}{C.X}")
         if scan_dir:
             try:
                 with open(os.path.join(scan_dir, "summary.md"), "w", encoding="utf-8") as f:
                     f.write(f"# {t['display']} - scan summary\n\n")
-                    f.write("No open ports parsed. Host may be down/filtered, or the VPN/route is down.\n")
+                    if problems:
+                        f.write("No open ports found, but the scan did not run cleanly:\n\n")
+                        for ln in problems:
+                            f.write(f"- {ln}\n")
+                    else:
+                        f.write("No open ports parsed. Host may be down/filtered, or the VPN/route is down.\n")
             except Exception:
                 pass
         return
@@ -465,11 +619,12 @@ def _scan_summary(t, xmlp, scan_dir=None, udp_rows=None):
     t["hostnames"] = hostnames
 
     # numbered next-step list (service -> command), stored for copy-by-number
+    # (deduped on the command itself, so http on 80 and on 8080 both get a step)
     steps, seen = [], set()
     for r in rows + udp_rows:
         hint = _service_hint(r["service"], r["port"], host)
-        if hint and r["service"] not in seen:
-            seen.add(r["service"]); steps.append((r["service"], hint))
+        if hint and hint not in seen:
+            seen.add(hint); steps.append((r["service"], hint))
     t["next_steps"] = steps
 
     # --- important info, on the terminal ---
@@ -503,7 +658,13 @@ def _scan_summary(t, xmlp, scan_dir=None, udp_rows=None):
             with open(os.path.join(scan_dir, "summary.md"), "w", encoding="utf-8") as f:
                 f.write(f"# {t['display']} - scan summary\n\n")
                 f.write(f"_Generated {datetime.datetime.now().isoformat(timespec='seconds')}_  \n")
-                f.write(f"Host: {host}\n\n## Open ports\n\n")
+                f.write(f"Host: {host}\n\n")
+                if problems:
+                    f.write("## Scan problems (results may be incomplete)\n\n")
+                    for ln in problems:
+                        f.write(f"- {ln}\n")
+                    f.write("\n")
+                f.write("## Open ports\n\n")
                 for r in rows + udp_rows:
                     ver = f"{r['product']} {r['version']}".strip()
                     f.write(f"- **{r['port']}/{r['proto']}** {r['service']}  {ver}\n")
@@ -527,7 +688,7 @@ def _scan_summary(t, xmlp, scan_dir=None, udp_rows=None):
             pass
 
 # ----------------------------------------------------------------------
-# flag catcher
+# saved results
 # ----------------------------------------------------------------------
 def _iter_result_files():
     """Every file under results/, recursing into the per-scan subfolders."""
@@ -541,93 +702,167 @@ def _iter_result_files():
 # ----------------------------------------------------------------------
 # active recon  -  runs standard tools, saves output to results/
 # ----------------------------------------------------------------------
+def _last_line(path):
+    """Last meaningful line of a tool's output, to show why it failed."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = [_strip_ansi(ln).strip() for ln in f]
+    except OSError:
+        return ""
+    lines = [ln for ln in lines if ln and not ln.startswith(("$ ", "# "))]
+    return lines[-1][:120] if lines else ""
+
+# exit codes that mean "ran fine" for tools that do not just use 0
+_OK_RC = {"nikto": (0, 1)}   # nikto exits 1 whenever it reports findings
+
 def _run_tool(cmd, outpath):
+    """Run one tool, output captured to outpath. Returns (state, message) where
+    state is ok | failed | timeout | skipped | error, so callers can tell a
+    clean run from one that died part way."""
     exe = cmd[0]
-    if shutil.which(exe) is None:
-        return f"{C.DIM}skipped ({exe} not installed){C.X}"
+    if exe == "sudo":                      # the real tool is the first non-flag arg
+        exe = next((a for a in cmd[1:] if not a.startswith("-")), "sudo")
+    if shutil.which(cmd[0]) is None or shutil.which(exe) is None:
+        return "skipped", f"{C.DIM}skipped ({exe} not installed){C.X}"
     try:
         with open(outpath, "w", encoding="utf-8", errors="replace") as f:
             f.write("$ " + " ".join(cmd) + "\n")
             f.write("# " + datetime.datetime.now().isoformat(timespec="seconds") + "\n\n")
             f.flush()
-            proc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, timeout=SCAN_TIMEOUT)
-        return f"{C.G}done{C.X} (rc={proc.returncode})  ->  {C.CY}{outpath}{C.X}"
+            # stdin from /dev/null: a tool that stops to ask a question (nikto's
+            # update prompt) would otherwise hang the scan behind a log file.
+            # sudo still prompts, it reads the password from the terminal itself.
+            proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=f,
+                                  stderr=subprocess.STDOUT, timeout=SCAN_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return f"{C.Y}timed out{C.X} after {SCAN_TIMEOUT // 60}m (partial)  ->  {C.CY}{outpath}{C.X}"
+        lim = f"{SCAN_TIMEOUT // 60}m" if SCAN_TIMEOUT >= 60 else f"{SCAN_TIMEOUT}s"
+        return "timeout", f"{C.Y}timed out{C.X} after {lim} (partial)  ->  {C.CY}{outpath}{C.X}"
     except Exception as e:
-        return f"{C.R}error: {e}{C.X}"
+        return "error", f"{C.R}error: {e}{C.X}"
+    if proc.returncode not in _OK_RC.get(os.path.basename(exe), (0,)):
+        why = _last_line(outpath)
+        return "failed", (f"{C.Y}exited with rc={proc.returncode}, check the output{C.X}  ->  {C.CY}{outpath}{C.X}"
+                          + (f"\n      {C.DIM}{why}{C.X}" if why else ""))
+    return "ok", f"{C.G}done{C.X}  ->  {C.CY}{outpath}{C.X}"
 
 def _run_nmap(t, scan_dir):
     """Two-stage TCP nmap: a fast full-range sweep to find open ports, then
     -sV -sC against ONLY those ports. Faster than one -sV -sC -p- and just as
-    reliable. Returns (nmap_xml_path, [open ports]) and prints progress."""
+    reliable. Returns (nmap_xml_path, [open ports], rows, [problems]) and
+    prints progress. A stage that dies part way is reported in problems
+    instead of being mistaken for a host with nothing open."""
     host = t["host"]
+    fam = _nmap_family(host)
     timing = CONFIG.get("nmap_timing") or "-T4"
     stage1_xml = os.path.join(scan_dir, "nmap_ports.xml")
+    stage1_txt = os.path.join(scan_dir, "nmap_ports.txt")
     nmap_xml = os.path.join(scan_dir, "nmap.xml")
+    problems = []
+    if shutil.which("nmap") is None:
+        print(f"  {C.R}nmap is not installed.{C.X}")
+        problems.append("nmap is not installed, so nothing was scanned (menu [m] -> Install / check tools).")
+        return nmap_xml, [], [], problems
     print(f"  {C.B}nmap 1/2{C.X}  {C.DIM}full-range sweep, all 65535 ports (-Pn -p- {timing}){C.X}")
-    print(f"    {_run_tool(['nmap', '-Pn', '-p-', timing, '-oX', stage1_xml, host], os.path.join(scan_dir, 'nmap_ports.txt'))}")
+    # -v makes nmap print each open port as soon as it finds it, so a sweep
+    # that gets cut off can still report what it reached
+    st, msg = _run_tool(["nmap", *fam, "-v", "-Pn", "-p-", timing, "-oX", stage1_xml, host], stage1_txt)
+    print(f"    {msg}")
     ports = _open_ports(stage1_xml)
+    if st != "ok":
+        ports = sorted(set(ports) | set(_discovered_ports(stage1_txt)), key=int)
+        hint = " Try nmap_timing -T3, a steadier VPN, or a longer SCAN_TIMEOUT." if st == "timeout" else ""
+        problems.append(f"port sweep did not finish ({st}); the port list only covers what it reached.{hint}")
     if not ports:
-        return nmap_xml, []
+        return nmap_xml, [], [], problems
     plist = ",".join(ports)
     print(f"    {C.G}{len(ports)} open:{C.X} {C.W}{plist}{C.X}")
     print(f"  {C.B}nmap 2/2{C.X}  {C.DIM}service + default scripts on open ports (-sV -sC){C.X}")
-    print(f"    {_run_tool(['nmap', '-sV', '-sC', '-Pn', '-p', plist, timing, '-oX', nmap_xml, host], os.path.join(scan_dir, 'nmap.txt'))}")
-    return nmap_xml, ports
+    st, msg = _run_tool(["nmap", *fam, "-sV", "-sC", "-Pn", "-p", plist, timing, "-oX", nmap_xml, host],
+                        os.path.join(scan_dir, "nmap.txt"))
+    print(f"    {msg}")
+    rows = _parse_nmap_xml(nmap_xml)
+    if st != "ok":
+        problems.append(f"service scan (-sV -sC) did not finish ({st}); service names are guessed "
+                        "from the port number and there are no script findings.")
+        rows = _guess_rows(ports)
+    elif not rows:
+        problems.append("the sweep found open ports but the service scan saw none open; "
+                        "listing them with names guessed from the port number.")
+        rows = _guess_rows(ports)
+    return nmap_xml, ports, rows, problems
 
-def _web_present(t, rows):
-    """True if this looks like a web target: web kind, or an http service open."""
+def _web_urls(t, rows):
+    """(label, url) for every web service to enumerate. A URL target is used as
+    given. For a host target, one URL per http(s) port nmap found, with that
+    port and the right scheme (not just http:// on port 80)."""
     if t["kind"] == "web":
-        return True
-    return any("http" in (r.get("service") or "").lower() for r in rows)
+        if "://" in t["display"]:
+            return [("", t["display"])]
+        return [("", _web_url("http", t["host"], t.get("port"), t.get("path")))]
+    out = []
+    for r in rows:
+        svc = (r.get("service") or "").lower()
+        if r.get("proto", "tcp") == "tcp" and "http" in svc:
+            out.append((r["port"], _web_url(_http_scheme(svc, r["port"]), t["host"], r["port"])))
+    return out
 
 def _smb_present(rows):
     return any((r.get("service") or "").lower() in ("microsoft-ds", "netbios-ssn")
                or r.get("port") in ("445", "139") for r in rows)
 
+def _as_root(cmd):
+    """Prefix sudo when we are not root and the scan type needs it (nmap -sU).
+    sudo asks for the password on the terminal even with output redirected."""
+    if hasattr(os, "geteuid") and os.geteuid() != 0 and shutil.which("sudo"):
+        return ["sudo"] + cmd
+    return cmd
+
 def _extra_jobs(t, scan_dir, nmap_xml, rows, deep=False, udp=False):
     """Non-nmap recon jobs as (label, command, outpath), written in scan_dir.
-    searchsploit always; UDP, SMB enum (netexec) and the web enum tools are
-    opt-in via deep/udp. Uses CONFIG for the dir tool, timing and vhost domain."""
+    searchsploit whenever the service scan finished; UDP, SMB enum (netexec)
+    and the web enum tools are opt-in via deep/udp. Uses CONFIG for the dir
+    tool, timing and vhost domain."""
     host = t["host"]
+    fam = _nmap_family(host)
     timing = CONFIG.get("nmap_timing") or "-T4"
 
     def p(name):
         return os.path.join(scan_dir, name)
 
-    jobs = [("searchsploit", ["searchsploit", "--nmap", nmap_xml], p("searchsploit.txt"))]
+    jobs = []
+    if _parse_nmap_xml(nmap_xml):          # searchsploit needs real -sV output
+        jobs.append(("searchsploit", ["searchsploit", "--nmap", nmap_xml], p("searchsploit.txt")))
 
     if udp:
         jobs.append(("nmap-udp",
-                     ["nmap", "-sU", "-Pn", "--top-ports", str(CONFIG.get("udp_top_ports", "20")),
-                      timing, "-oX", p("nmap_udp.xml"), host],
+                     _as_root(["nmap", *fam, "-sU", "-Pn", "--top-ports", str(CONFIG.get("udp_top_ports", "20")),
+                               timing, "-oX", p("nmap_udp.xml"), host]),
                      p("nmap_udp.txt")))
 
     if deep:
         # extra nmap pass with the known-CVE vuln scripts, on the open ports
-        if rows:
-            pl = ",".join(r["port"] for r in rows)
+        tcp = [r["port"] for r in rows if r.get("proto", "tcp") == "tcp"]
+        if tcp:
             jobs.append(("nmap-vuln",
-                         ["nmap", "-sV", "--script", "vuln", "-Pn", "-p", pl, timing, host],
+                         ["nmap", *fam, "-sV", "--script", "vuln", "-Pn", "-p", ",".join(tcp), timing, host],
                          p("nmap_vuln.txt")))
         # SMB box -> netexec enumerates shares/users/null-session (read-only)
         if _smb_present(rows):
             jobs.append(("netexec-smb", ["netexec", "smb", host], p("netexec_smb.txt")))
-        # web target -> fingerprint + dir brute + quick issues + optional vhosts
-        if _web_present(t, rows):
-            url = t["display"] if "://" in t["display"] else "http://" + t["display"]
-            jobs.append(("whatweb", ["whatweb", "-a", "3", url], p("whatweb.txt")))
-            jobs.append(("nikto", ["nikto", "-h", url, "-maxtime", "120s"], p("nikto.txt")))
-            dc = _dir_cmd(url, p("dirscan.txt"))
+        # each web service -> fingerprint + dir brute + quick issues + optional vhosts
+        vhost = CONFIG.get("vhost_domain", "").strip()
+        for port, url in _web_urls(t, rows):
+            sfx = f"_{port}" if port else ""
+            jobs.append((f"whatweb {url}", ["whatweb", "-a", "3", url], p(f"whatweb{sfx}.txt")))
+            jobs.append((f"nikto {url}", ["nikto", "-h", url, "-maxtime", "120s", "-ask", "no"], p(f"nikto{sfx}.txt")))
+            dc = _dir_cmd(url)
             if dc:
-                jobs.append((dc[0], dc[1], p("dirscan.txt")))
-            vhost = CONFIG.get("vhost_domain", "").strip()
+                jobs.append((f"{dc[0]} {url}", dc[1], p(f"dirscan{sfx}.txt")))
             if vhost and WORDLIST and shutil.which("ffuf"):
-                jobs.append(("ffuf-vhost",
+                jobs.append((f"ffuf-vhost {url}",
                              ["ffuf", "-u", url, "-H", f"Host: FUZZ.{vhost}",
                               "-w", WORDLIST, "-ac", "-s"],
-                             p("vhosts.txt")))
+                             p(f"vhosts{sfx}.txt")))
     return jobs
 
 def _auth_gate(host, extra=""):
@@ -641,7 +876,6 @@ def _consolidate_scan(scan_dir):
     intermediate files, leaving a tidy folder: summary.md + nmap.xml + details.txt.
     Run this AFTER _scan_summary (which still needs searchsploit.txt / the XMLs)."""
     keep_as_is = {"summary.md", "details.txt", "nmap.xml"}
-    drop = {"nmap_ports.txt"}
     parts = []
     try:
         names = sorted(os.listdir(scan_dir))
@@ -651,7 +885,7 @@ def _consolidate_scan(scan_dir):
         fp = os.path.join(scan_dir, fn)
         if not os.path.isfile(fp) or fn in keep_as_is:
             continue
-        if fn in drop or fn.endswith(".xml"):      # intermediate nmap_ports/nmap_udp XML
+        if fn.endswith(".xml"):                    # intermediate nmap_ports/nmap_udp XML
             try: os.remove(fp)
             except OSError: pass
             continue
@@ -671,7 +905,11 @@ def _consolidate_scan(scan_dir):
 def _recon_core(t, deep=False, udp=False):
     """Two-stage nmap + searchsploit (plus opt-in UDP / web enum) for one target,
     into a dedicated per-scan folder. Prints the important findings to the
-    terminal and writes summary.md. No prompts. Returns the scan folder path."""
+    terminal and writes summary.md. No prompts. Returns the scan folder path,
+    or None if the target was refused."""
+    if not _valid_host(t.get("host") or ""):
+        print(f"  {C.R}refusing to scan {t.get('display')!r}: the host is not a plain IP or hostname.{C.X}")
+        return None
     base = _safe(t["display"]); tsd = _ts()
     scan_dir = os.path.join(RESULTS_DIR, f"{base}_{tsd}")
     os.makedirs(scan_dir, exist_ok=True)
@@ -681,16 +919,18 @@ def _recon_core(t, deep=False, udp=False):
         if os.path.exists(fp) and fp not in t["results"]:
             t["results"].append(fp)
 
-    nmap_xml, ports = _run_nmap(t, scan_dir)
-    rows = _parse_nmap_xml(nmap_xml)
+    nmap_xml, ports, rows, problems = _run_nmap(t, scan_dir)
     if ports or udp:
         for label, cmd, outpath in _extra_jobs(t, scan_dir, nmap_xml, rows, deep=deep, udp=udp):
-            if label == "searchsploit" and not ports:
-                continue
             print(f"  {C.B}running {label}...{C.X}")
-            print(f"    {_run_tool(cmd, outpath)}")
+            if cmd[0] == "sudo":
+                print(f"    {C.DIM}this scan needs root; sudo may ask for your password{C.X}")
+            st, msg = _run_tool(cmd, outpath)
+            print(f"    {msg}")
+            if label.startswith("nmap") and st not in ("ok", "skipped"):
+                problems.append(f"{label} did not finish ({st}): {_last_line(outpath) or 'see details.txt'}")
     udp_rows = _parse_nmap_xml(os.path.join(scan_dir, "nmap_udp.xml")) if udp else []
-    _scan_summary(t, nmap_xml, scan_dir, udp_rows=udp_rows)
+    _scan_summary(t, rows, nmap_xml, scan_dir, udp_rows=udp_rows, problems=problems)
     if CONFIG.get("keep_raw_files"):
         for fn in sorted(os.listdir(scan_dir)):
             keep(os.path.join(scan_dir, fn))
@@ -709,6 +949,8 @@ def run_recon(t):
         print(f"  {C.DIM}cancelled.{C.X}"); pause(); return
     print()
     scan_dir = _recon_core(t)
+    if not scan_dir:
+        pause(); return
     _save(TARGETS_FILE, _targets_with(t))
     print(f"\n  {C.G}Results saved under:{C.X} {C.CY}{scan_dir}{C.X}")
     _post_scan_actions(t)
@@ -725,6 +967,8 @@ def full_scan_target(t, deep=False):
         print(f"  {C.DIM}cancelled.{C.X}"); pause(); return
     print()
     scan_dir = _recon_core(t, deep=deep, udp=deep)
+    if not scan_dir:
+        pause(); return
     _save(TARGETS_FILE, _targets_with(t))
     print(f"\n  {C.G}Done. Results under:{C.X} {C.CY}{scan_dir}{C.X}")
     _post_scan_actions(t)
@@ -802,7 +1046,7 @@ def _post_scan_actions(t):
         if tool:
             print(f"  {C.G}copied:{C.X} {steps[int(ch)][1]}")
         else:
-            print(f"  {C.DIM}no clipboard tool (apt install xclip). cmd:{C.X} {steps[int(ch)][1]}")
+            print(f"  {C.DIM}no clipboard tool (install xclip or wl-clipboard). cmd:{C.X} {steps[int(ch)][1]}")
         pause()
 
 def _write_box_report(t):
@@ -846,23 +1090,6 @@ def _targets_with(updated):
             return targets
     targets.append(updated)
     return targets
-
-SEC_HEADERS = [
-    ("content-security-policy", "missing_csp", "Content-Security-Policy"),
-    ("strict-transport-security", "missing_hdrs", "Strict-Transport-Security"),
-    ("x-frame-options", "missing_hdrs", "X-Frame-Options (clickjacking)"),
-    ("x-content-type-options", "missing_hdrs", "X-Content-Type-Options (MIME sniffing)"),
-    ("referrer-policy", "missing_hdrs", "Referrer-Policy"),
-]
-SENSITIVE_PATHS = [
-    ("robots.txt", None), ("sitemap.xml", None),
-    (".git/HEAD", "exposed_git"), (".env", "exposed_env"),
-    ("server-status", None), ("backup.zip", None),
-    (".DS_Store", None), ("admin/", "default_admin"), ("login", None),
-]
-
-
-
 
 # ----------------------------------------------------------------------
 # report
@@ -965,6 +1192,9 @@ def screen_targets():
             raw = input("  target (IP, host:port, or https://... link): ").strip()
             parsed = classify_target(raw)
             if not parsed:
+                if raw:
+                    print(f"  {C.R}not a valid IP, host:port, or http(s):// URL.{C.X}")
+                    pause()
                 continue
             owner = input("  owner (optional): ").strip()
             parsed["owner"] = owner or "-"
@@ -1059,12 +1289,15 @@ def write_setup():
         with open(path, "w", encoding="utf-8") as f:
             f.write(SETUP_SCRIPT)
         os.chmod(path, 0o755)
-        print(f"\n  {C.G}Wrote role-aware setup script to:{C.X} {path}")
+        print(f"\n  {C.G}Wrote setup script to:{C.X} {path}")
         print(f"  Run it on any machine:  {C.CY}bash setup.sh{C.X}")
-        print(f"  {C.DIM}Installs standard free tooling via apt or pacman. Review it before running.{C.X}")
+        print(f"  {C.DIM}Installs standard free tooling via apt, pacman or brew. Review it before running.{C.X}")
     except Exception as e:
         print(f"\n  {C.R}could not write setup.sh: {e}{C.X}")
     pause()
+
+# whichever clipboard tool this box has (pbcopy on macOS, wl-copy on Wayland, X11 tools)
+_CLIP_BIN = next((b for b in ("pbcopy", "wl-copy", "xclip", "xsel") if shutil.which(b)), "xclip")
 
 # the binaries Poly actually invokes, in the order they matter
 TOOL_AUDIT = [
@@ -1073,7 +1306,7 @@ TOOL_AUDIT = [
     ("whatweb", "whatweb"), ("nikto", "nikto"),
     ("netexec", "netexec"), ("enum4linux-ng", "enum4linux-ng"),
     ("sqlmap", "sqlmap"), ("snmpwalk", "snmpwalk"),
-    ("hydra", "hydra"), ("john", "john"), ("xclip (arsenal copy)", "xclip"),
+    ("hydra", "hydra"), ("john", "john"), ("clipboard (copy)", _CLIP_BIN),
 ]
 
 def _missing_tools():
@@ -1093,8 +1326,8 @@ def install_tools():
         print(f"\n  {C.G}All set - everything Poly uses is installed.{C.X}")
         pause(); return
     print(f"\n  {C.Y}Missing ({len(missing)}):{C.X} {', '.join(missing)}")
-    print(f"  {C.DIM}Poly will write setup.sh next to itself and run it (apt + pipx).")
-    print(f"  apt will ask for your sudo password. To read it first: menu [m] -> Write setup.sh.{C.X}")
+    print(f"  {C.DIM}Poly will write setup.sh next to itself and run it (apt/pacman/brew + pipx).")
+    print(f"  apt and pacman will ask for your sudo password. To read it first: menu [m] -> Write setup.sh.{C.X}")
     if input(f"\n  Install the missing tools now? [{C.G}y{C.X}/{C.R}N{C.X}] ").strip().lower() != "y":
         print(f"  {C.DIM}skipped.{C.X}"); pause(); return
     path = os.path.join(_HERE, "setup.sh")
@@ -1266,11 +1499,11 @@ def _find_repo(names):
     return _first_existing(cands, want_dir=True)
 
 def _clip(text):
-    for tool in (["xclip", "-selection", "clipboard"], ["xsel", "-ib"], ["wl-copy"]):
+    for tool in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
         if shutil.which(tool[0]):
             try:
-                subprocess.run(tool, input=text.encode(), timeout=5)
-                return tool[0]
+                if subprocess.run(tool, input=text.encode(), timeout=5).returncode == 0:
+                    return tool[0]
             except Exception:
                 pass
     return None
@@ -1348,7 +1581,7 @@ def screen_arsenal():
             if tool:
                 print(f"  {C.G}copied ({tool}):{C.X} {found[int(ch)]}")
             else:
-                print(f"  {C.DIM}no clipboard tool (apt install xclip). path:{C.X} {found[int(ch)]}")
+                print(f"  {C.DIM}no clipboard tool (install xclip or wl-clipboard). path:{C.X} {found[int(ch)]}")
             pause()
 
 # ----------------------------------------------------------------------
@@ -1419,6 +1652,8 @@ def _quick_target(raw):
         print(f"  {C.DIM}cancelled.{C.X}"); pause(); return
     print()
     scan_dir = _recon_core(t)
+    if not scan_dir:
+        pause(); return
     _save(TARGETS_FILE, _targets_with(t))
     print(f"\n  {C.G}Done. Results under:{C.X} {C.CY}{scan_dir}{C.X}")
     print(f"  {C.DIM}Saved to the board - open [1] for a deep scan ([e]), loot, or status.{C.X}")
@@ -1426,26 +1661,81 @@ def _quick_target(raw):
     _save(TARGETS_FILE, _targets_with(t))
     pause()
 
+_SAMPLE_XML = """<?xml version="1.0"?>
+<nmaprun><host><ports>
+<port protocol="tcp" portid="22"><state state="open"/><service name="ssh" product="OpenSSH" version="8.9p1"/></port>
+<port protocol="tcp" portid="443"><state state="open"/><service name="http" tunnel="ssl" product="nginx"/>
+<script id="ssl-cert" output="Subject: commonName=box.htb&#xa;Subject Alternative Name: DNS:dev.box.htb"/></port>
+<port protocol="tcp" portid="8080"><state state="open"/><service name="http-proxy"/></port>
+<port protocol="tcp" portid="9999"><state state="closed"/><service name="abyss"/></port>
+<port protocol="tcp" portid="5000"><state state="open"/><service name="unknown" servicefp="SF-Port5000-TCP:V=7.94%r(GetRequest,B7,&quot;HTTP/1\\.0\\x20200\\x20OK\\r\\nServer:\\x20Werkzeug&quot;)"/></port>
+<port protocol="tcp" portid="6000"><state state="open"/><service name="unknown" servicefp="SF-Port6000-TCP:V=7.94%r(NULL,10,&quot;SSH-2\\.0-x&quot;)"/></port>
+</ports></host></nmaprun>
+"""
+
+def _selftest():
+    """Offline checks of the parsing and command building. No network, no tools."""
+    ct = classify_target
+    # option injection: nothing that starts with '-' may become a host
+    for bad in ("--script=/tmp/x.nse", "-iL/etc/passwd", "-oN /tmp/x", "http://-x/",
+                "ftp://box.htb", "box.htb:abc", "a b", "10.10.10.5:70000", "[::1", ""):
+        assert ct(bad) is None, bad
+    assert not _valid_host("-sV") and _valid_host("box.htb") and _valid_host("10.10.10.5")
+    t = ct("10.10.10.5:8080")
+    assert (t["kind"], t["host"], t["port"]) == ("host", "10.10.10.5", 8080), t
+    t = ct("box.htb/admin")
+    assert (t["kind"], t["host"], t["path"]) == ("web", "box.htb", "/admin"), t
+    t = ct("https://box.htb:8443/app")
+    assert (t["host"], t["port"], t["scheme"]) == ("box.htb", 8443, "https"), t
+    t = ct("[dead:beef::1]:80")
+    assert (t["host"], t["port"]) == ("dead:beef::1", 80), t
+    assert ct("::1")["host"] == "::1"
+    assert _nmap_family("dead:beef::1") == ["-6"] and _nmap_family("10.10.10.5") == []
+
+    with tempfile.TemporaryDirectory() as d:
+        xp = os.path.join(d, "nmap.xml")
+        with open(xp, "w", encoding="utf-8") as f:
+            f.write(_SAMPLE_XML)
+        rows = _parse_nmap_xml(xp)
+        assert [r["port"] for r in rows] == ["22", "443", "8080", "5000", "6000"], rows
+        assert rows[1]["service"] == "ssl/http", rows[1]
+        assert rows[3]["service"] == "http" and rows[4]["service"] == "unknown", rows[3:]
+        assert _open_ports(xp) == ["22", "443", "8080", "5000", "6000"]
+        rows = rows[:3]
+        scripts = _parse_scripts(xp)
+        assert _hostnames_from_scripts(scripts, "10.10.10.5") == ["box.htb", "dev.box.htb"]
+
+        # web enum hits each http port with the right scheme
+        host_t = ct("10.10.10.5")
+        assert _web_urls(host_t, rows) == [("443", "https://10.10.10.5/"),
+                                           ("8080", "http://10.10.10.5:8080/")], _web_urls(host_t, rows)
+        assert _web_urls(ct("[dead:beef::1]"), rows)[1][1] == "http://[dead:beef::1]:8080/"
+        assert _web_urls(ct("http://box.htb:81/x"), rows) == [("", "http://box.htb:81/x")]
+        assert "https://10.10.10.5/" in _service_hint("ssl/http", "443", "10.10.10.5")
+
+        # a sweep killed part way: XML has no ports, the -v log still does
+        trunc = os.path.join(d, "trunc.xml")
+        with open(trunc, "w", encoding="utf-8") as f:
+            f.write('<?xml version="1.0"?><nmaprun><host><ports><port protocol="tcp" portid="22">')
+        assert _open_ports(trunc) == [] and _parse_nmap_xml(trunc) == []
+        log = os.path.join(d, "nmap_ports.txt")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write("Discovered open port 8080/tcp on 10.10.10.5\n"
+                    "Discovered open port 22/tcp on 10.10.10.5\n"
+                    "Discovered open port 22/tcp on 10.10.10.5\n")
+        assert _discovered_ports(log) == ["22", "8080"]
+        assert _guess_rows(["22"])[0]["service"] == "ssh"
+
+        # a tool that exits non-zero is reported as failed, not done
+        if shutil.which("false"):
+            st, _ = _run_tool(["false"], os.path.join(d, "f.txt"))
+            assert st == "failed", st
+        st, _ = _run_tool(["poly-no-such-tool"], os.path.join(d, "n.txt"))
+        assert st == "skipped", st
+
 def main():
     if "--check" in sys.argv:
-        header()
-        for _, _, fn in MENU:
-            assert callable(fn)
-        for fn in (run_recon, _run_nmap, _extra_jobs, _open_ports,
-                   full_scan_target, scan_all, _recon_core, _write_report,
-                   _iter_result_files, _parse_nmap_xml, _scan_summary,
-                   _top_cves, screen_cheatsheet, screen_search,
-                   screen_arsenal, _resolve_wordlist, _find_repo, _arsenal_find, _clip,
-                   screen_more, _dir_cmd, _web_present, _smb_present, _status_badge,
-                   _quick_target, install_tools, _parse_scripts, _script_findings,
-                   _hostnames_from_scripts, _hosts_text, _add_hosts, _post_scan_actions,
-                   _write_box_report, screen_advisor, screen_links, screen_targets,
-                   write_setup, export_report, _consolidate_scan, _view_target,
-                   _targets_with, _missing_tools, _human, _first_existing,
-                   _resolve_wordlist, classify_target, _safe, _ts, _load, _save):
-            assert callable(fn)
-        for _, fn in MORE:
-            assert callable(fn)
+        _selftest()
         print("selftest ok")
         return
     keys = {key for key, _, _ in MENU}
